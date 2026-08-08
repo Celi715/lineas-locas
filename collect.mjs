@@ -23,6 +23,11 @@ const POLL_INTERVAL_S = 30
 const POLL_COUNT = 2
 const POLL_GAP_MS = 30_000
 const INSERT_CHUNK_SIZE = 1000
+// Un colectivo que se apaga (vuelve a cochera) deja de aparecer en el feed.
+// Si no se vio en más de esto, se borra su historial entero al terminar la
+// corrida, para que el próximo viaje arranque con el buffer limpio en vez de
+// arrastrar puntos del recorrido anterior.
+const STALE_THRESHOLD_S = 5 * 60
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -99,6 +104,18 @@ async function pollOnce(client, n) {
   console.log(`poll ${n}/${POLL_COUNT}: ${vehicles.length} vehiculos guardados`)
 }
 
+async function cleanupStaleVehicles(client) {
+  const threshold = Math.floor(Date.now() / 1000) - STALE_THRESHOLD_S
+  const res = await client.query(
+    `DELETE FROM vehicle_positions
+     WHERE vehicle_id IN (
+       SELECT vehicle_id FROM vehicle_positions GROUP BY vehicle_id HAVING MAX(ts) < $1
+     )`,
+    [threshold]
+  )
+  if (res.rowCount) console.log(`cleanup: ${res.rowCount} puntos borrados de vehiculos inactivos`)
+}
+
 async function main() {
   const client = new Client({
     connectionString: requireEnv("DATABASE_URL"),
@@ -110,6 +127,7 @@ async function main() {
       await pollOnce(client, i)
       if (i < POLL_COUNT) await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS))
     }
+    await cleanupStaleVehicles(client)
   } finally {
     await client.end()
   }

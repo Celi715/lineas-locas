@@ -1,0 +1,14 @@
+{
+  "name": "lineas-locas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Recolector periódico de posiciones GPS de colectivos (GBA) para armar historial de recorridos.",
+  "scripts": {
+    "collect": "node collect.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "protobufjs": "^7.4.0"
+  }
+}

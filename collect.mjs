@@ -132,7 +132,15 @@ async function main() {
   await client.connect()
   try {
     for (let i = 1; i <= POLL_COUNT; i++) {
-      await pollOnce(client, i)
+      // Un poll individual puede fallar por lentitud puntual de la API de
+      // Transporte (le pasa seguido) — no vale la pena perder el resto de la
+      // ventana de 5 minutos por eso, así que se loguea y se sigue con el
+      // próximo poll en vez de cortar toda la corrida.
+      try {
+        await pollOnce(client, i)
+      } catch (err) {
+        console.error(`poll ${i}/${POLL_COUNT} fallo:`, err.message || err)
+      }
       if (i < POLL_COUNT) await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS))
     }
     await cleanupStaleVehicles(client)

@@ -1,12 +1,15 @@
 // Pega al feed GTFS-realtime de colectivos del GBA y guarda, para cada
 // vehículo, un buffer circular de hasta MAX_POINTS posiciones en Postgres
-// (Supabase). Se corre dos veces por invocación (con una pausa de
-// POLL_GAP_MS en el medio) para lograr ~30s de granularidad aunque el cron
-// que dispara esto solo pueda programarse cada 1 minuto.
+// (Supabase). GitHub Actions no permite crons de menos de 5 minutos (uno de
+// cada 1 minuto simplemente no se ejecuta, sin avisar), así que esta corrida
+// hace varios polls espaciados por POLL_GAP_MS para cubrir esa ventana de
+// 5 minutos con ~30s de granularidad.
 //
-// El slot dentro del buffer circular se calcula por bloque de tiempo
-// (floor(ts / POLL_INTERVAL_S) % MAX_POINTS) en vez de con un contador
-// persistido aparte: un solo INSERT multi-fila por poll alcanza, sin
+// El slot dentro del buffer circular se calcula por bloque de tiempo de
+// nuestro propio reloj al consultar (no del timestamp que reporta cada
+// vehículo: si su GPS no actualiza tan seguido como cada 30s, dos polls
+// nuestros verían el mismo timestamp reportado y se pisarían en vez de
+// generar dos puntos). Un solo INSERT multi-fila por poll alcanza, sin
 // necesidad de leer nada antes de escribir.
 
 import protobuf from "protobufjs"
@@ -20,7 +23,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GBA_BBOX = { minLat: -35.74, maxLat: -34.07, minLon: -59.58, maxLon: -57.95 }
 const MAX_POINTS = 100
 const POLL_INTERVAL_S = 30
-const POLL_COUNT = 2
+// 9 polls * 30s de pausa = 4 min de ventana cubierta, con margen antes de
+// que dispare la próxima corrida programada (cada 5 min, el mínimo real de
+// GitHub Actions).
+const POLL_COUNT = 9
 const POLL_GAP_MS = 30_000
 const INSERT_CHUNK_SIZE = 1000
 // Un colectivo que se apaga (vuelve a cochera) deja de aparecer en el feed.
@@ -43,7 +49,7 @@ async function getFeedMessageType() {
   return feedMessageType
 }
 
-async function fetchVehicles() {
+async function fetchVehicles(pollTime) {
   const clientId = requireEnv("BA_TRANSPORTE_CLIENT_ID")
   const clientSecret = requireEnv("BA_TRANSPORTE_CLIENT_SECRET")
 
@@ -55,6 +61,7 @@ async function fetchVehicles() {
   const msg = FeedMessage.decode(new Uint8Array(await res.arrayBuffer()))
   const obj = FeedMessage.toObject(msg, { longs: String, defaults: true })
 
+  const slot = Math.floor(pollTime / POLL_INTERVAL_S) % MAX_POINTS
   const vehicles = []
   for (const entity of obj.entity || []) {
     const v = entity.vehicle
@@ -64,14 +71,14 @@ async function fetchVehicles() {
     if (lat < GBA_BBOX.minLat || lat > GBA_BBOX.maxLat || lon < GBA_BBOX.minLon || lon > GBA_BBOX.maxLon) continue
     const label = v.vehicle.label || ""
     const m = label.match(/^(\d+)-(.+)$/)
-    const ts = Number(v.timestamp) || Math.floor(Date.now() / 1000)
+    const ts = Number(v.timestamp) || pollTime
     vehicles.push({
       vehicleId: v.vehicle.id,
       interno: m ? m[1] : null,
       lat,
       lon,
       ts,
-      slot: Math.floor(ts / POLL_INTERVAL_S) % MAX_POINTS,
+      slot,
     })
   }
   return vehicles
@@ -99,7 +106,8 @@ async function savePositions(client, vehicles) {
 }
 
 async function pollOnce(client, n) {
-  const vehicles = await fetchVehicles()
+  const pollTime = Math.floor(Date.now() / 1000)
+  const vehicles = await fetchVehicles(pollTime)
   await savePositions(client, vehicles)
   console.log(`poll ${n}/${POLL_COUNT}: ${vehicles.length} vehiculos guardados`)
 }

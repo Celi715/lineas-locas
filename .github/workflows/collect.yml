@@ -1,12 +1,26 @@
 name: Recolectar posiciones
 
+# Solo workflow_dispatch: el disparo real cada 5 min lo hace un cron externo
+# (cron-job.org) pegándole a la API de despacho de este workflow. El
+# "schedule" nativo de GitHub Actions se sacó a propósito: además de ser
+# poco puntual (no garantiza el minuto exacto), tenerlo activo A LA VEZ que
+# el disparo externo hacía que de vez en cuando quedaran dos corridas vivas
+# en simultáneo, y dos `collect.mjs` pegándole a la misma tabla de Postgres
+# al mismo tiempo producía "deadlock detected" en el DELETE de limpieza,
+# tirando abajo la corrida entera con exit code 1.
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Cinturón y tiradores además de sacar el "schedule": si por lo que sea
+# (un reintento manual, un doble disparo del cron externo) dos ejecuciones
+# quedan encoladas igual, esto hace que la segunda ESPERE a que termine la
+# primera en vez de correr en paralelo — nunca hay dos escribiendo a la vez.
+concurrency:
+  group: collect-positions
+  cancel-in-progress: false
 
 jobs:
   collect:

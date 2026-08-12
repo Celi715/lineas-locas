@@ -32,8 +32,12 @@ const INSERT_CHUNK_SIZE = 1000
 // Un colectivo que se apaga (vuelve a cochera) deja de aparecer en el feed.
 // Si no se vio en más de esto, se borra su historial entero al terminar la
 // corrida, para que el próximo viaje arranque con el buffer limpio en vez de
-// arrastrar puntos del recorrido anterior.
-const STALE_THRESHOLD_S = 5 * 60
+// arrastrar puntos del recorrido anterior. 15 min (no 5) a propósito: le da
+// margen para absorber una corrida entera perdida (falla de conexión,
+// deadlock, etc.) sin confundir a un vehículo todavía activo con uno
+// apagado — con 5 min, una sola corrida fallida ya alcanzaba para borrar de
+// más.
+const STALE_THRESHOLD_S = 15 * 60
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -112,16 +116,35 @@ async function pollOnce(client, n) {
   console.log(`poll ${n}/${POLL_COUNT}: ${vehicles.length} vehiculos guardados`)
 }
 
+// Código de error de Postgres para "deadlock detected". Con el trigger
+// duplicado ya sacado (ver collect.yml) no debería pasar más, pero si dos
+// corridas llegaran a solaparse igual, un deadlock es transitorio: la otra
+// transacción ya se abortó para resolverlo, así que un reintento inmediato
+// normalmente entra sin problema.
+const DEADLOCK_CODE = "40P01"
+const CLEANUP_RETRIES = 2
+
 async function cleanupStaleVehicles(client) {
   const threshold = Math.floor(Date.now() / 1000) - STALE_THRESHOLD_S
-  const res = await client.query(
-    `DELETE FROM vehicle_positions
-     WHERE vehicle_id IN (
-       SELECT vehicle_id FROM vehicle_positions GROUP BY vehicle_id HAVING MAX(ts) < $1
-     )`,
-    [threshold]
-  )
-  if (res.rowCount) console.log(`cleanup: ${res.rowCount} puntos borrados de vehiculos inactivos`)
+  for (let attempt = 0; attempt <= CLEANUP_RETRIES; attempt++) {
+    try {
+      const res = await client.query(
+        `DELETE FROM vehicle_positions
+         WHERE vehicle_id IN (
+           SELECT vehicle_id FROM vehicle_positions GROUP BY vehicle_id HAVING MAX(ts) < $1
+         )`,
+        [threshold]
+      )
+      if (res.rowCount) console.log(`cleanup: ${res.rowCount} puntos borrados de vehiculos inactivos`)
+      return
+    } catch (err) {
+      if (err.code === DEADLOCK_CODE && attempt < CLEANUP_RETRIES) {
+        console.error(`cleanup: deadlock, reintentando (${attempt + 1}/${CLEANUP_RETRIES})`)
+        continue
+      }
+      throw err
+    }
+  }
 }
 
 async function main() {
@@ -143,7 +166,16 @@ async function main() {
       }
       if (i < POLL_COUNT) await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS))
     }
-    await cleanupStaleVehicles(client)
+    // Los 9 polls de arriba ya guardaron los datos de esta corrida (lo que
+    // de verdad importa). Si la limpieza de vehículos inactivos falla
+    // después de agotar los reintentos, no vale la pena tirar toda la
+    // corrida como fallida por eso — se loguea y la próxima corrida limpia
+    // lo que quedó pendiente.
+    try {
+      await cleanupStaleVehicles(client)
+    } catch (err) {
+      console.error("cleanup fallo:", err.message || err)
+    }
   } finally {
     await client.end()
   }

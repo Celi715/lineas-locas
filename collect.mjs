@@ -114,6 +114,7 @@ async function pollOnce(client, n) {
   const vehicles = await fetchVehicles(pollTime)
   await savePositions(client, vehicles)
   console.log(`poll ${n}/${POLL_COUNT}: ${vehicles.length} vehiculos guardados`)
+  return true
 }
 
 // Código de error de Postgres para "deadlock detected". Con el trigger
@@ -124,6 +125,17 @@ async function pollOnce(client, n) {
 const DEADLOCK_CODE = "40P01"
 const CLEANUP_RETRIES = 2
 
+// Compara el último dato guardado de cada vehículo contra el reloj de PARED
+// ("ahora"), no contra "la última vez que pudimos leer la API con éxito". Si
+// la API de BA Transporte estuvo caída más de STALE_THRESHOLD_S (le pasa
+// seguido, a veces por minutos u horas — ver app/api/vehicle-positions en el
+// sitio principal), ningún vehículo tiene datos frescos aunque TODOS sigan
+// circulando: el problema fue nuestro, no de ellos. Sin la guarda de más
+// abajo (solo limpiar si esta corrida efectivamente consiguió datos
+// nuevos), esto borraba el historial completo de TODA la flota apenas la
+// API volvía a responder — el buffer nunca llegaba a completarse porque se
+// reseteaba solo cada vez que había un corte, por eso "nunca termina de
+// llegar a los 100 puntos".
 async function cleanupStaleVehicles(client) {
   const threshold = Math.floor(Date.now() / 1000) - STALE_THRESHOLD_S
   for (let attempt = 0; attempt <= CLEANUP_RETRIES; attempt++) {
@@ -154,27 +166,36 @@ async function main() {
   })
   await client.connect()
   try {
+    let anyPollSucceeded = false
     for (let i = 1; i <= POLL_COUNT; i++) {
       // Un poll individual puede fallar por lentitud puntual de la API de
       // Transporte (le pasa seguido) — no vale la pena perder el resto de la
       // ventana de 5 minutos por eso, así que se loguea y se sigue con el
       // próximo poll en vez de cortar toda la corrida.
       try {
-        await pollOnce(client, i)
+        if (await pollOnce(client, i)) anyPollSucceeded = true
       } catch (err) {
         console.error(`poll ${i}/${POLL_COUNT} fallo:`, err.message || err)
       }
       if (i < POLL_COUNT) await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS))
     }
-    // Los 9 polls de arriba ya guardaron los datos de esta corrida (lo que
-    // de verdad importa). Si la limpieza de vehículos inactivos falla
+    // Solo limpiar si ESTA corrida efectivamente consiguió datos frescos de
+    // la API en al menos un poll — si los 9 fallaron (API caída toda la
+    // ventana), no tenemos forma de saber qué vehículos siguen circulando y
+    // cuáles no, así que no hay que tocar nada (ver comentario en
+    // cleanupStaleVehicles). Los 9 polls de arriba ya guardaron los datos
+    // de esta corrida (lo que de verdad importa). Si la limpieza falla
     // después de agotar los reintentos, no vale la pena tirar toda la
     // corrida como fallida por eso — se loguea y la próxima corrida limpia
     // lo que quedó pendiente.
-    try {
-      await cleanupStaleVehicles(client)
-    } catch (err) {
-      console.error("cleanup fallo:", err.message || err)
+    if (anyPollSucceeded) {
+      try {
+        await cleanupStaleVehicles(client)
+      } catch (err) {
+        console.error("cleanup fallo:", err.message || err)
+      }
+    } else {
+      console.error("cleanup: se salta esta corrida, los 9 polls fallaron (probable caída de la API)")
     }
   } finally {
     await client.end()

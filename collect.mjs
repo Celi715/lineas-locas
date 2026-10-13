@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url"
 const { Client } = pg
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const GBA_BBOX = { minLat: -35.74, maxLat: -34.07, minLon: -59.58, maxLon: -57.95 }
+const GBA_BBOX = { minLat: -41.0, maxLat: -33.2, minLon: -63.5, maxLon: -56.6 }
 const MAX_POINTS = 100
 const POLL_INTERVAL_S = 30
 // 9 polls * 30s de pausa = 4 min de ventana cubierta, con margen antes de
